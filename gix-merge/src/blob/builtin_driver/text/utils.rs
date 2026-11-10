@@ -420,8 +420,9 @@ pub fn take_intersecting(
     intersecting.clear();
 
     fn left_overlaps_right(left: &Hunk, right: &Hunk) -> bool {
-        // Like Git, consider changes disjoint only if there is a gap between their base ranges.
-        left.side != right.side && left.before.start <= right.before.end
+        left.side != right.side
+            && (right.before.contains(&left.before.start)
+                || (right.before.is_empty() && right.before.start == left.before.start))
     }
 
     loop {
