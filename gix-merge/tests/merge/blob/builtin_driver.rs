@@ -493,6 +493,40 @@ mod text {
         }
     }
 
+    mod insert_order {
+        use gix_merge::blob::{Resolution, builtin_driver, builtin_driver::text::Conflict};
+        use imara_diff::InternedInput;
+
+        #[test]
+        fn orders_parallel_insertions_and_reverse_cherry_pick() {
+            let base = b"line1\nline2\n";
+            let ours = b"line1\ndefault_block\nline2\n";
+            let theirs = b"line1\n// [gix-merge-insert-order: -1]\nearly_block\nline2\n";
+
+            let labels = builtin_driver::text::Labels {
+                ancestor: Some("base".into()),
+                current: Some("ours".into()),
+                other: Some("theirs".into()),
+            };
+            let options = builtin_driver::text::Options {
+                diff_algorithm: imara_diff::Algorithm::Myers,
+                conflict: Conflict::Keep {
+                    style: builtin_driver::text::ConflictStyle::Merge,
+                    marker_size: 7.try_into().unwrap(),
+                },
+            };
+
+            let mut out = Vec::new();
+            let mut input = InternedInput::default();
+            let res = builtin_driver::text(&mut out, &mut input, labels, ours, base, theirs, options);
+            assert_eq!(res, Resolution::Complete);
+            assert_eq!(
+                String::from_utf8_lossy(&out),
+                "line1\n// [gix-merge-insert-order: -1]\nearly_block\ndefault_block\nline2\n"
+            );
+        }
+    }
+
     mod baseline {
         use std::path::Path;
 

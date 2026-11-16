@@ -1,14 +1,12 @@
 use std::ops::Range;
 
-use crate::blob::{
-    Resolution,
-    builtin_driver::text::{
-        Conflict, ConflictStyle, Labels, Merge, Options,
-        utils::{
-            Hunk, Side, assure_ends_with_nl, collect_hunks, contains_lines, detect_line_ending,
-            detect_line_ending_or_nl, fill_ancestor, hunks_differ_in_diff3, take_intersecting, tokens, write_ancestor,
-            write_conflict_marker, write_hunks, zealously_contract_hunks,
-        },
+use crate::blob::Resolution;
+use crate::blob::builtin_driver::text::{
+    Conflict, ConflictStyle, Labels, Merge, Options,
+    utils::{
+        Hunk, Side, assure_ends_with_nl, collect_hunks, contains_lines, detect_line_ending, detect_line_ending_or_nl,
+        fill_ancestor, hunks_differ_in_diff3, take_intersecting, tokens, try_resolve_ordered_hunks, write_ancestor,
+        write_conflict_marker, write_hunks, zealously_contract_hunks,
     },
 };
 
@@ -85,6 +83,23 @@ impl<'input, 'data> Merge<'input, 'data> {
             }
 
             let filled_hunks_side = current_hunks.first().expect("at least one hunk").side;
+            {
+                let (our_hunks, their_hunks) = match filled_hunks_side {
+                    Side::Current => (current_hunks.as_slice(), intersecting.as_slice()),
+                    Side::Other => (intersecting.as_slice(), current_hunks.as_slice()),
+                    Side::Ancestor => unreachable!("initial hunks are never ancestors"),
+                };
+                if try_resolve_ordered_hunks(
+                    our_hunks,
+                    their_hunks,
+                    input,
+                    current_tokens,
+                    &mut ancestor_integrated_until,
+                    out,
+                ) {
+                    continue;
+                }
+            }
             {
                 let filled_hunks_range = before_range_from_hunks(&current_hunks);
                 let intersecting_range = before_range_from_hunks(&intersecting);

@@ -9,8 +9,7 @@ edition = "2024"
 rust-version = "1.88"
 include = ["/src/**/*", "/LICENSE-*"]
 
-[lints]
-workspace = true
+[workspace]
 
 [lib]
 doctest = false

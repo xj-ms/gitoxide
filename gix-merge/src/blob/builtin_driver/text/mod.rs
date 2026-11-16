@@ -140,3 +140,4 @@ pub struct Merge<'input, 'data> {
 
 pub(super) mod function;
 mod utils;
+pub use utils::{parse_insert_order_line, split_ordered_line_ranges};

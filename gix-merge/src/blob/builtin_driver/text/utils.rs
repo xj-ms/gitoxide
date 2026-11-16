@@ -132,7 +132,9 @@ pub fn fill_ancestor(Range { start, end }: &Range<u32>, in_out: &mut Vec<Hunk>) 
 
     let mut added_hunks = false;
     for (idx, next_idx) in (first_idx..in_out.len()).map(|idx| (idx, idx + 1)) {
-        let Some(next_hunk) = in_out.get(next_idx) else { break };
+        let Some(next_hunk) = in_out.get(next_idx) else {
+            break;
+        };
         let hunk = &in_out[idx];
         if let Some(lines_to_add) = next_hunk.before.start.checked_sub(hunk.before.end).filter(is_nonzero) {
             in_out.push(ancestor_hunk(hunk.before.end, lines_to_add));
@@ -483,4 +485,393 @@ pub fn collect_hunks(
         side,
     }));
     hunks
+}
+
+const INSERT_ORDER_PREFIX: &[u8] = b"[gix-merge-insert-order:";
+
+/// Parse a standalone `[gix-merge-insert-order: <i32>]` directive line.
+///
+/// Any surrounding comment syntax made of ASCII whitespace and non-quote ASCII punctuation
+/// (such as `//`, `#`, `--`, `;`, `/* ... */`, `<!-- ... -->`, `{/* ... */}`) is accepted.
+pub fn parse_insert_order_line(line: &[u8]) -> Option<i32> {
+    let trimmed = line.trim_ascii();
+    let start = trimmed.find(INSERT_ORDER_PREFIX)?;
+    let rest = &trimmed[start + INSERT_ORDER_PREFIX.len()..];
+    let end = rest.find_byte(b']')?;
+    let prefix = &trimmed[..start];
+    let inner = &rest[..end];
+    let suffix = &rest[end + 1..];
+
+    let is_comment_wrapper_byte =
+        |b: u8| b.is_ascii_whitespace() || (b.is_ascii_punctuation() && !matches!(b, b'"' | b'\'' | b'`'));
+    if !prefix.iter().copied().all(is_comment_wrapper_byte) || !suffix.iter().copied().all(is_comment_wrapper_byte) {
+        return None;
+    }
+
+    std::str::from_utf8(inner.trim_ascii()).ok()?.parse::<i32>().ok()
+}
+
+/// Split `num_lines` lines into `(line_range, explicit_order)` segments based on
+/// `[gix-merge-insert-order: <i32>]` directives.
+///
+/// `line_at(idx)` returns the raw bytes of line `idx` (`0..num_lines`).
+/// Each returned tuple is `(start..end, Some(order))` for a directive-controlled segment
+/// or `(start..end, None)` for an unmarked segment (whose implicit merge order is `0`).
+pub fn split_ordered_line_ranges<'a>(
+    num_lines: usize,
+    mut line_at: impl FnMut(usize) -> &'a [u8],
+) -> Vec<(Range<usize>, Option<i32>)> {
+    if num_lines == 0 {
+        return Vec::new();
+    }
+    let mut directives = Vec::new();
+    for idx in 0..num_lines {
+        if let Some(order) = parse_insert_order_line(line_at(idx)) {
+            directives.push((idx, order));
+        }
+    }
+
+    if directives.is_empty() {
+        return vec![(0..num_lines, None)];
+    }
+
+    let mut segments = Vec::with_capacity(directives.len() + 1);
+    let (first_idx, first_order) = directives[0];
+    let has_non_blank_before_first = (0..first_idx).any(|idx| !line_at(idx).trim_ascii().is_empty());
+
+    let first_seg_start = if has_non_blank_before_first {
+        segments.push((0..first_idx, None));
+        first_idx
+    } else {
+        0
+    };
+
+    let first_seg_end = directives.get(1).map_or(num_lines, |(idx, _)| *idx);
+    segments.push((first_seg_start..first_seg_end, Some(first_order)));
+
+    for (i, &(dir_idx, dir_order)) in directives.iter().enumerate().skip(1) {
+        let seg_end = directives.get(i + 1).map_or(num_lines, |(idx, _)| *idx);
+        segments.push((dir_idx..seg_end, Some(dir_order)));
+    }
+
+    segments
+}
+
+struct OrderedSegment {
+    order: i32,
+    explicit: bool,
+    hunk: Hunk,
+}
+
+fn split_ordered_segments(
+    hunk: &Hunk,
+    input: &imara_diff::InternedInput<&[u8]>,
+    current_tokens: &[imara_diff::Token],
+) -> Vec<OrderedSegment> {
+    let tokens = tokens_for_side(hunk.side, input, current_tokens);
+    let base_idx = hunk.after.start as usize;
+    let num_lines = (hunk.after.end - hunk.after.start) as usize;
+    split_ordered_line_ranges(num_lines, |rel_idx| input.interner[tokens[base_idx + rel_idx]])
+        .into_iter()
+        .map(|(range, explicit_order)| OrderedSegment {
+            order: explicit_order.unwrap_or(0),
+            explicit: explicit_order.is_some(),
+            hunk: Hunk {
+                before: hunk.before.clone(),
+                after: (hunk.after.start + range.start as u32)..(hunk.after.start + range.end as u32),
+                side: hunk.side,
+            },
+        })
+        .collect()
+}
+
+fn hunks_tokens_equal(
+    a: &Hunk,
+    b: &Hunk,
+    input: &imara_diff::InternedInput<&[u8]>,
+    current_tokens: &[imara_diff::Token],
+) -> bool {
+    let a_tokens = &tokens_for_side(a.side, input, current_tokens)[usize_range(&a.after)];
+    let b_tokens = &tokens_for_side(b.side, input, current_tokens)[usize_range(&b.after)];
+    a_tokens == b_tokens
+}
+
+fn range_has_insert_order(
+    tokens: &[imara_diff::Token],
+    range: &Range<u32>,
+    interner: &imara_diff::Interner<&[u8]>,
+) -> bool {
+    tokens[usize_range(range)]
+        .iter()
+        .any(|t| parse_insert_order_line(interner[*t]).is_some())
+}
+
+pub fn try_resolve_ordered_hunks(
+    our_hunks: &[Hunk],
+    their_hunks: &[Hunk],
+    input: &imara_diff::InternedInput<&[u8]>,
+    current_tokens: &[imara_diff::Token],
+    ancestor_integrated_until: &mut u32,
+    out: &mut Vec<u8>,
+) -> bool {
+    // Case 1: Both sides are pure insertions at the same base line `k`.
+    if our_hunks.len() == 1 && their_hunks.len() == 1 {
+        let our_hunk = &our_hunks[0];
+        let their_hunk = &their_hunks[0];
+        if our_hunk.before.is_empty()
+            && their_hunk.before.is_empty()
+            && our_hunk.before.start == their_hunk.before.start
+            && !our_hunk.after.is_empty()
+            && !their_hunk.after.is_empty()
+        {
+            let mut segments = split_ordered_segments(our_hunk, input, current_tokens);
+            segments.extend(split_ordered_segments(their_hunk, input, current_tokens));
+            if segments.iter().any(|s| s.explicit) {
+                segments.sort_by_key(|s| s.order);
+                let mut deduped: Vec<OrderedSegment> = Vec::with_capacity(segments.len());
+                let mut tie_conflict = false;
+                for seg in segments {
+                    if let Some(prev) = deduped.last()
+                        && prev.order == seg.order
+                    {
+                        if hunks_tokens_equal(&prev.hunk, &seg.hunk, input, current_tokens) {
+                            continue;
+                        }
+                        tie_conflict = true;
+                        break;
+                    }
+                    deduped.push(seg);
+                }
+                if !tie_conflict {
+                    let k = our_hunk.before.start;
+                    write_ancestor(input, *ancestor_integrated_until, k as usize, out);
+                    *ancestor_integrated_until = k;
+                    let nl = detect_line_ending_or_nl(our_hunks, input, current_tokens);
+                    for (idx, seg) in deduped.iter().enumerate() {
+                        if idx > 0 {
+                            assure_ends_with_nl(out, nl);
+                        }
+                        write_hunks(std::slice::from_ref(&seg.hunk), input, current_tokens, out);
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Case 2: One side is a pure deletion `del_start..del_end -> empty`, and the other side is
+    // one or more pure insertions within `del_start..=del_end`, where either the insertion or the
+    // deleted range carries `[gix-merge-insert-order: ...]`.
+    let maybe_del_ins = if our_hunks.len() == 1 && !our_hunks[0].before.is_empty() && our_hunks[0].after.is_empty() {
+        Some((&our_hunks[0], their_hunks))
+    } else if their_hunks.len() == 1 && !their_hunks[0].before.is_empty() && their_hunks[0].after.is_empty() {
+        Some((&their_hunks[0], our_hunks))
+    } else {
+        None
+    };
+
+    if let Some((del_hunk, ins_hunks)) = maybe_del_ins
+        && !ins_hunks.is_empty()
+        && ins_hunks.iter().all(|h| {
+            h.before.is_empty()
+                && !h.after.is_empty()
+                && del_hunk.before.start <= h.before.start
+                && h.before.start <= del_hunk.before.end
+        })
+    {
+        let has_order_marker = range_has_insert_order(&input.before, &del_hunk.before, &input.interner)
+            || ins_hunks.iter().any(|h| {
+                let side_tokens = tokens_for_side(h.side, input, current_tokens);
+                range_has_insert_order(side_tokens, &h.after, &input.interner)
+            });
+        if has_order_marker {
+            let mut del_start = del_hunk.before.start;
+            let mut del_end = del_hunk.before.end;
+            let first_ins_start = ins_hunks[0].before.start;
+            while del_start < first_ins_start
+                && input.before.get(del_end as usize) == input.before.get(del_start as usize)
+            {
+                del_start += 1;
+                del_end += 1;
+            }
+            write_ancestor(input, *ancestor_integrated_until, del_start as usize, out);
+            let nl = detect_line_ending_or_nl(ins_hunks, input, current_tokens);
+            for (idx, ins_hunk) in ins_hunks.iter().enumerate() {
+                if idx > 0 {
+                    assure_ends_with_nl(out, nl);
+                }
+                let ins_tokens = tokens_for_side(ins_hunk.side, input, current_tokens);
+                let mut ins_before = ins_hunk.before.start;
+                let mut a_start = ins_hunk.after.start;
+                let a_end = ins_hunk.after.end;
+                while ins_before < del_end
+                    && a_start < a_end
+                    && ins_tokens.get(a_start as usize) == input.before.get(ins_before as usize)
+                {
+                    a_start += 1;
+                    ins_before += 1;
+                }
+                if a_start < a_end {
+                    let main_part = Hunk {
+                        before: ins_hunk.before.clone(),
+                        after: a_start..a_end,
+                        side: ins_hunk.side,
+                    };
+                    write_hunks(std::slice::from_ref(&main_part), input, current_tokens, out);
+                }
+                if ins_hunk.after.start < a_start {
+                    let rotated_part = Hunk {
+                        before: ins_hunk.before.clone(),
+                        after: ins_hunk.after.start..a_start,
+                        side: ins_hunk.side,
+                    };
+                    write_hunks(std::slice::from_ref(&rotated_part), input, current_tokens, out);
+                }
+            }
+            *ancestor_integrated_until = del_end;
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod insert_order_tests {
+    use super::parse_insert_order_line;
+    use crate::blob::{
+        Resolution, builtin_driver,
+        builtin_driver::text::{Conflict, ConflictStyle, Labels, Options},
+    };
+    use imara_diff::InternedInput;
+
+    fn run_merge(base: &[u8], ours: &[u8], theirs: &[u8]) -> (Resolution, String) {
+        let labels = Labels {
+            ancestor: Some("base".into()),
+            current: Some("ours".into()),
+            other: Some("theirs".into()),
+        };
+        let options = Options {
+            diff_algorithm: imara_diff::Algorithm::Myers,
+            conflict: Conflict::Keep {
+                style: ConflictStyle::Merge,
+                marker_size: 7.try_into().unwrap(),
+            },
+        };
+        let mut out = Vec::new();
+        let mut input = InternedInput::default();
+        let res = builtin_driver::text(&mut out, &mut input, labels, ours, base, theirs, options);
+        (res, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn parse_insert_order_line_is_language_agnostic_and_rejects_code_or_quotes() {
+        assert_eq!(
+            parse_insert_order_line(b"  // [gix-merge-insert-order: -10]\n"),
+            Some(-10)
+        );
+        assert_eq!(parse_insert_order_line(b"# [gix-merge-insert-order: 20]\r\n"), Some(20));
+        assert_eq!(
+            parse_insert_order_line(b"<!-- [gix-merge-insert-order: 5] -->\n"),
+            Some(5)
+        );
+        assert_eq!(parse_insert_order_line(b"/* [gix-merge-insert-order: 0] */\n"), Some(0));
+        assert_eq!(
+            parse_insert_order_line(b"{/* [gix-merge-insert-order: 42] */}\n"),
+            Some(42)
+        );
+        assert_eq!(
+            parse_insert_order_line(b"-- [gix-merge-insert-order: 100]\n"),
+            Some(100)
+        );
+
+        // Rejects string literals and code on the same line
+        assert_eq!(
+            parse_insert_order_line(b"let s = \"[gix-merge-insert-order: 10]\";\n"),
+            None
+        );
+        assert_eq!(
+            parse_insert_order_line(b"foo(); // [gix-merge-insert-order: 10]\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn forward_merge_orders_marked_insertion_against_unmarked_default_zero() {
+        let base = b"header\nfooter\n";
+        let unmarked = b"header\nline_default_0\nfooter\n";
+        let marked_before = b"header\n// [gix-merge-insert-order: -10]\nline_before\nfooter\n";
+        let marked_after = b"header\n// [gix-merge-insert-order: 10]\nline_after\nfooter\n";
+
+        let (res1, out1) = run_merge(base, unmarked, marked_before);
+        assert_eq!(res1, Resolution::Complete);
+        assert_eq!(
+            out1,
+            "header\n// [gix-merge-insert-order: -10]\nline_before\nline_default_0\nfooter\n"
+        );
+
+        let (res2, out2) = run_merge(base, unmarked, marked_after);
+        assert_eq!(res2, Resolution::Complete);
+        assert_eq!(
+            out2,
+            "header\nline_default_0\n// [gix-merge-insert-order: 10]\nline_after\nfooter\n"
+        );
+    }
+
+    #[test]
+    fn forward_merge_chains_three_parallel_insertions_commutatively() {
+        let base = b"start\nend\n";
+        let branch_a = b"start\nblock_a\nend\n"; // implicit order 0
+        let branch_b = b"start\n# [gix-merge-insert-order: -5]\nblock_b\nend\n";
+        let branch_c = b"start\n# [gix-merge-insert-order: 5]\nblock_c\nend\n";
+
+        // Merge A and C first, then B
+        let (res_ac, merged_ac) = run_merge(base, branch_a, branch_c);
+        assert_eq!(res_ac, Resolution::Complete);
+        let (res_acb, merged_acb) = run_merge(base, merged_ac.as_bytes(), branch_b);
+        assert_eq!(res_acb, Resolution::Complete);
+
+        // Merge B and C first, then A
+        let (res_bc, merged_bc) = run_merge(base, branch_b, branch_c);
+        assert_eq!(res_bc, Resolution::Complete);
+        let (res_bca, merged_bca) = run_merge(base, merged_bc.as_bytes(), branch_a);
+        assert_eq!(res_bca, Resolution::Complete);
+
+        let expected =
+            "start\n# [gix-merge-insert-order: -5]\nblock_b\nblock_a\n# [gix-merge-insert-order: 5]\nblock_c\nend\n";
+        assert_eq!(merged_acb, expected);
+        assert_eq!(merged_bca, expected);
+    }
+
+    #[test]
+    fn forward_merge_conflicts_on_distinct_hunks_with_same_order_and_deduplicates_identical() {
+        let base = b"start\nend\n";
+        let branch_1 = b"start\n// [gix-merge-insert-order: 10]\nalpha\nend\n";
+        let branch_2 = b"start\n// [gix-merge-insert-order: 10]\nbeta\nend\n";
+
+        let (res_conflict, _) = run_merge(base, branch_1, branch_2);
+        assert_eq!(res_conflict, Resolution::Conflict);
+
+        let (res_same, out_same) = run_merge(base, branch_1, branch_1);
+        assert_eq!(res_same, Resolution::Complete);
+        assert_eq!(out_same, "start\n// [gix-merge-insert-order: 10]\nalpha\nend\n");
+    }
+
+    #[test]
+    fn reverse_cherry_pick_resolves_insertion_adjacent_to_deleted_other_branches() {
+        // Simulates `but_core::tree::create_tree`:
+        // base = HEAD^{tree} (has branch_a and branch_b)
+        // ours = target_tree (base without branch_a and branch_b)
+        // theirs = worktree (HEAD^{tree} + new branch_c with insert-order marker and trailing `}`)
+        let head_tree = b"fn main() {\n    {\n        branch_a();\n    }\n    {\n        branch_b();\n    }\n}\n";
+        let target_tree = b"fn main() {\n}\n";
+        let worktree = b"fn main() {\n    {\n        branch_a();\n    }\n    {\n        branch_b();\n    }\n    // [gix-merge-insert-order: 10]\n    {\n        branch_c();\n    }\n}\n";
+
+        let (res, out) = run_merge(head_tree, target_tree, worktree);
+        assert_eq!(res, Resolution::Complete);
+        assert_eq!(
+            out,
+            "fn main() {\n    // [gix-merge-insert-order: 10]\n    {\n        branch_c();\n    }\n}\n"
+        );
+    }
 }
